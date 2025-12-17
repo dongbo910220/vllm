@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+import time
 from typing import TYPE_CHECKING, Any, Optional
 
 import regex as re
@@ -110,6 +111,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
         # paged KV buffer. Requests can be preempted and later resumed with new
         # blocks, so we must allow re-loading when block_ids change.
         self._loaded_req_block_ids: dict[str, tuple[int, ...]] = {}
+        # Track how long a request has been waiting for remote KV arrival.
+        self._wait_start_ts: dict[str, float] = {}
         self._finished_recving_req_ids: set[str] = set()
         self._invalid_block_ids: set[int] = set()
 
@@ -230,6 +233,11 @@ class P2pNcclConnector(KVConnectorBase_V1):
             return
 
         # Load the KV for each request each layer (non-blocking).
+        async_kv_load_timeout_s = float(
+            self._kv_transfer_config.get_from_extra_config(
+                "async_kv_load_timeout_s", 60.0
+            )
+        )
         for request in metadata.requests:
             request_id = request.request_id
             block_ids_key = tuple(int(b) for b in request.block_ids.tolist())
@@ -279,7 +287,28 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     tensor_ids
                 ):
                     # Not ready yet (prefill may not have sent KV caches).
-                    continue
+                    #
+                    # If KV caches never arrive (e.g. transient send failures),
+                    # we must not wait forever. After a configurable timeout,
+                    # mark the blocks invalid to trigger recompute.
+                    if async_kv_load_timeout_s > 0:
+                        start_ts = self._wait_start_ts.get(request_id)
+                        if start_ts is None:
+                            self._wait_start_ts[request_id] = time.monotonic()
+                            continue
+                        waited_s = time.monotonic() - start_ts
+                        if waited_s < async_kv_load_timeout_s:
+                            continue
+                        logger.warning(
+                            "🚧remote KV wait timeout, request_id=%s waited=%.2fs "
+                            "timeout=%.2fs; trigger recompute",
+                            request_id,
+                            waited_s,
+                            async_kv_load_timeout_s,
+                        )
+                        ok = False
+                    else:
+                        continue
 
                 for layer_name, layer in layers_to_load:
                     kv_cache = self.p2p_nccl_engine.get_recv_tensor(
@@ -308,11 +337,13 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 if self.p2p_nccl_engine.send_type != "GET":
                     self._finished_recving_req_ids.add(request_id)
                 self._loaded_req_block_ids[request_id] = block_ids_key
+                self._wait_start_ts.pop(request_id, None)
                 continue
 
             if self.p2p_nccl_engine.send_type != "GET":
                 self._finished_recving_req_ids.add(request_id)
             self._loaded_req_block_ids[request_id] = block_ids_key
+            self._wait_start_ts.pop(request_id, None)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
@@ -421,6 +452,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
         # Clear worker-side loaded bookkeeping for finished requests.
         for req_id in finished_req_ids:
             self._loaded_req_block_ids.pop(req_id, None)
+            self._wait_start_ts.pop(req_id, None)
 
         finished_recving: set[str] | None = None
         if not self.is_producer and self._finished_recving_req_ids:
